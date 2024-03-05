@@ -6,8 +6,4 @@ target_link_libraries(${PROJECT_NAME}
 )
 
 # install
-install(TARGETS ${PROJECT_NAME}
-	LIBRARY DESTINATION lib
-	ARCHIVE DESTINATION lib
-	RUNTIME DESTINATION bin
-)
+install(TARGETS ${PROJECT_NAME})
