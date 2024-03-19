@@ -10,7 +10,9 @@
 #include <map>
 #include <codecvt>
 #include <ranges>
-
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 
 // todo:
 // https://steamcdn-a.akamaihd.net/apps/valve/2007/SIGGRAPH2007_AlphaTestedMagnification.pdf
@@ -23,10 +25,15 @@ constexpr char INDENT[] = "    ";
 
 
 struct GlyphInfo {
-    GlyphInfo(std::string_view s) : s(s) {}
+    GlyphInfo(std::string_view text, bool printable = true) : text(text), printable(printable) {}
 
     // text that is represented by this glyph (single character, utf-8 sequence, ligature)
-    std::string s;
+    std::string text;
+
+    bool printable;
+
+    // text as code point or offset into text data
+    int t;
 
     // offset of glyph data in data array
     int offset;
@@ -34,10 +41,8 @@ struct GlyphInfo {
     // top y coordinate of glyph
     int y;
 
-    // width of glyph
+    // size of glyph
     int w;
-
-    // height of glyph
     int h;
 
     // glyph data
@@ -57,21 +62,52 @@ int toInt(const std::string &str) {
 /**
  * Add monochome placeholder that is inserted for unknown characters
  */
-GlyphInfo addMonoPlaceholder(GlyphInfo &info) {
-    info.y = 8;
-    info.w = 7;
-    info.h = 8;
+GlyphInfo addMonoPlaceholder(GlyphInfo &info, int w, int h) {
+    info.y = h;
+    info.w = w;
+    info.h = h;
 
-    uint8_t buffer[] = {0xfe, 0xc6, 0xaa, 0x92, 0x92, 0xaa, 0xc6, 0xfe};
-    info.data.assign(std::begin(buffer), std::end(buffer));
+    int m = w / 2;
+
+    int pitch = (w + 7) / 8;
+    info.data.resize(pitch * h);
+    for (int j = 0; j < h; ++j) {
+        uint8_t *row = info.data.data() + j * pitch;
+        for (int i = 0; i < w; ++i) {
+            int x = std::min(i, w - 1 - i);
+            int y = std::min(j, h - 1 - j);
+
+            bool border = x == 0 || y == 0;
+            bool cross = w >= 7 && (y == x || (y > x && x == m));
+
+            if (border || cross)
+                row[i / 8] |= 0x80 >> (i & 7);
+        }
+    }
 
     return info;
 }
 
-GlyphInfo addGrayPlaceholder(GlyphInfo &info) {
-    info.y = 0;
-    info.w = 0;
-    info.h = 0;
+GlyphInfo addGrayPlaceholder(GlyphInfo &info, int w, int h) {
+    info.y = h;
+    info.w = w;
+    info.h = h;
+
+    int m = w / 2;
+
+    info.data.resize(w * h);
+    for (int j = 0; j < h; ++j) {
+        uint8_t *row = info.data.data() + j * w;
+        for (int i = 0; i < w; ++i) {
+            int x = std::min(i, w - 1 - i);
+            int y = std::min(j, h - 1 - j);
+
+            bool border = x == 0 || y == 0;
+            bool cross = w >= 7 && (y == x || (y > x && x == m));
+
+            row[i] = (border || cross) ? 255 : 0;
+        }
+    }
 
     return info;
 }
@@ -192,7 +228,7 @@ void addGrayData2D(std::vector<uint8_t> &texture, int width, GlyphInfo &info, in
         std::copy(src, src + info.w, dst);
     }
 
-    info.offset = offset.x | (offset.y << 16);
+    info.offset = offset.x | (offset.y << 12);
     offset.x += info.w + 1;
     rowHeight = std::max(rowHeight, info.h);
 }
@@ -226,6 +262,9 @@ void writeGrayData2D(std::ofstream &cpp, const std::vector<uint8_t> &texture, in
     Usage: Label_Tool <text file>
 */
 int main(int argc, char **argv) {
+    SetConsoleOutputCP(CP_UTF8);
+    setvbuf(stdout, nullptr, _IOFBF, 1000);
+    //std::cout << "Ω" << std::endl;
     if (argc < 2)
         return 1;
 
@@ -291,6 +330,12 @@ int main(int argc, char **argv) {
     // collect glyphs
     std::vector<GlyphInfo> glyphInfos;
     glyphInfos.emplace_back(std::string());
+    const char *spaces[] = {
+        " "
+    };
+    for (auto ch : spaces) {
+        glyphInfos.emplace_back(ch, false);
+    }
     for (char ch = '!'; ch <= '~'; ++ch) {
         std::string s(1, ch);
         glyphInfos.emplace_back(s);
@@ -304,29 +349,53 @@ int main(int argc, char **argv) {
         "ä",
         "ö",
         "ü",
+        "Ω",
+        "μ",
     };
     for (auto ch : chars) {
-        std::string s(ch);
-        glyphInfos.emplace_back(s);
+        glyphInfos.emplace_back(ch);
     }
 
     // get glyph data
+    int heightl = 0;
     for (auto &info : glyphInfos) {
-        if (info.s.empty()) {
-            if (mode == FT_RENDER_MODE_MONO)
-                addMonoPlaceholder(info);
-            else
-                addGrayPlaceholder(info);
-        } else {
+        if (!info.text.empty()) {
             // get character code from utf-8 string
             std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t> convert;
-            int code = convert.from_bytes(info.s)[0];
+            int code = convert.from_bytes(info.text)[0];
 
-            if (mode == FT_RENDER_MODE_MONO)
+            if (info.printable) {
+                // printable glyph
                 setGlyph(info, face, code, mode);
-            else
-                setGlyph(info, face, code, mode);
+                info.t = code;
+
+                if (code == 'l')
+                    heightl = info.h;
+
+                // print to console
+                std::cout << code << ' ';
+                //std::cout << info.text;
+            } else {
+                // non-printable
+                info.t = code;
+                info.offset = 0xffffff;
+                info.y = 0;
+                info.w = fontSize / 10 + 1;
+                info.h = 0;
+            }
         }
+    }
+    std::cout << std::endl;
+
+    // generate placeholder glyph for unknown characters
+    {
+        auto &info = glyphInfos.front();
+        int w = heightl * 2 / 3 | 1;
+        if (mode == FT_RENDER_MODE_MONO)
+            addMonoPlaceholder(info, w, heightl);
+        else
+            addGrayPlaceholder(info, w, heightl);
+        info.t = 0;
     }
 
 
@@ -344,21 +413,27 @@ int main(int argc, char **argv) {
     cpp << "const uint8_t " << name << "Data[] = {" << std::endl;
     int dataSize;
     if (!tex) {
+        // linear data
         int offset = 0;
         for (auto &info : glyphInfos) {
-            if (mode == FT_RENDER_MODE_MONO)
-                writeMonoData1D(cpp, info, offset);
-            else
-                writeGrayData1D(cpp, info, offset);
+            if (info.printable) {
+                if (mode == FT_RENDER_MODE_MONO)
+                    writeMonoData1D(cpp, info, offset);
+                else
+                    writeGrayData1D(cpp, info, offset);
+            }
         }
         dataSize = offset;
     } else {
+        // texture (2D) data
         std::vector<uint8_t> texture;
         int2 offset = {1, 1};
         int rowHeight = 0;
         texture.resize(textureWidth * textureHeight);
         for (auto &info : glyphInfos) {
-            addGrayData2D(texture, textureWidth, info, offset, rowHeight);
+            if (info.printable) {
+                addGrayData2D(texture, textureWidth, info, offset, rowHeight);
+            }
         }
         int textureHeight = offset.y + rowHeight + 1;
         writeGrayData2D(cpp, texture, textureWidth, textureHeight);
@@ -373,35 +448,43 @@ int main(int argc, char **argv) {
     }
 
     // write Glyph structures
-    cpp << "const Font::Glyph " << name << "Glyphs[] = {" << std::endl;
+    cpp << "const Vector2<uint32_t> " << name << "Glyphs[] = {" << std::endl;
     int height = 0;
     for (auto &info : glyphInfos) {
         int y = maxY - info.y;
-        cpp << INDENT << "{";
-        cpp << toInt(info.s) << ", ";
-        cpp << info.offset << ", ";
-        cpp << y << ", ";
-        cpp << info.w << ", ";
-        cpp << info.h;
-        cpp << "},";
+
+		// t (glyph text): 18 bit
+		// w : 7 bit
+		// h : 7 bit
+		uint32_t infoX = info.t | (info.w << 18) | (info.h << 25);
+
+		// offset: 24 bit
+		// y : 7 bit
+		// flag (glyph code or offset): 1 bit
+		uint32_t infoY = info.offset | (y << 24);
+
+        cpp << INDENT << "{" << infoX << ", " << infoY << "},";
 
         // text represented by the glyph as comment
         cpp << " // ";
-        if (info.s == " " || info.s == "\\")
-            cpp << "'" << info.s << "'";
+        if (info.text == " " || info.text == "\\")
+            cpp << "'" << info.text << "'";
         else
-            cpp << info.s;
+            cpp << info.text;
         cpp << std::endl;
+
         height = std::max(y + info.h, height);
     }
     cpp << "};" << std::endl;
 
     // write font
+    int gapWidth = fontSize >= 10 ? 2 : 1;
     cpp << "extern const Font " << name << " = {" << std::endl;
     {
-        cpp << INDENT << "1, 2, 5, " << std::endl; // gapWidth, spaceWidth, tabWidth
-        cpp << INDENT << height << ", " << std::endl;
-        cpp << INDENT << name << "Data, " << dataSize << ", " << std::endl;
+        //cpp << INDENT << "1, 2, 5, " << std::endl; // gapWidth, spaceWidth, tabWidth
+        cpp << INDENT << gapWidth << "," << std::endl;
+        cpp << INDENT << height << "," << std::endl;
+        cpp << INDENT << name << "Data, " << dataSize << "," << std::endl;
         cpp << INDENT << name << "Glyphs, " << name << "Glyphs + " << glyphInfos.size() << "," << std::endl;
     }
     cpp << "};" << std::endl;
